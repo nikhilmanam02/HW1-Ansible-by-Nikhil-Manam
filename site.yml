@@ -1,0 +1,118 @@
+# site.yml
+# Run with:
+#   ansible-playbook -i inventory.ini site.yml -e action=deploy
+#   ansible-playbook -i inventory.ini site.yml -e action=undeploy
+
+- name: Deploy simple webserver on port 8080
+  hosts: web
+  become: true
+  vars:
+    web_root: /opt/simpleweb
+    service_name: simpleweb
+    listen_port: 8080
+  tasks:
+    - block:
+        - name: Ensure Python3 is present
+          package:
+            name: python3
+            state: present
+
+        - name: Create web root
+          file:
+            path: "{{ web_root }}"
+            state: directory
+            mode: "0755"
+
+        - name: Deploy index.html with per-VM message
+          template:
+            src: templates/index.html.j2
+            dest: "{{ web_root }}/index.html"
+            mode: "0644"
+
+        - name: Create systemd unit for Python HTTP server
+          template:
+            src: templates/simpleweb.service.j2
+            dest: /etc/systemd/system/{{ service_name }}.service
+            mode: "0644"
+
+        - name: Reload systemd
+          systemd:
+            daemon_reload: true
+
+        - name: Enable & start service
+          systemd:
+            name: "{{ service_name }}"
+            state: started
+            enabled: true
+
+        # Optional host firewall openings (no-op if not present/enabled)
+        - name: Allow 8080 via UFW (Debian/Ubuntu)
+          command: "ufw allow {{ listen_port }}/tcp"
+          when: ansible_facts.os_family == "Debian"
+          register: ufw_allow
+          failed_when: false
+          changed_when: "'added' in (ufw_allow.stdout | default('')) or 'updated' in (ufw_allow.stdout | default(''))"
+
+        - name: Allow 8080 via firewalld (RHEL family)
+          firewalld:
+            port: "{{ listen_port }}/tcp"
+            permanent: true
+            state: enabled
+            immediate: true
+          when: ansible_facts.os_family == "RedHat"
+
+        - name: Confirm port is listening
+          wait_for:
+            host: 127.0.0.1
+            port: "{{ listen_port }}"
+            state: started
+            timeout: 10
+      when: (action | default('deploy') | lower) == "deploy"
+
+
+- name: Un-deploy simple webserver and clean up
+  hosts: web
+  become: true
+  vars:
+    web_root: /opt/simpleweb
+    service_name: simpleweb
+    listen_port: 8080
+  tasks:
+    - block:
+        - name: Stop and disable service if present
+          systemd:
+            name: "{{ service_name }}"
+            state: stopped
+            enabled: false
+          ignore_errors: true
+
+        - name: Remove systemd unit file
+          file:
+            path: "/etc/systemd/system/{{ service_name }}.service"
+            state: absent
+
+        - name: Reload systemd
+          systemd:
+            daemon_reload: true
+
+        - name: Remove web root directory
+          file:
+            path: "{{ web_root }}"
+            state: absent
+
+        # Optional: close host firewall rules opened during deploy
+        - name: Remove UFW rule for 8080 (Debian/Ubuntu)
+          command: "ufw delete allow {{ listen_port }}/tcp"
+          when: ansible_facts.os_family == "Debian"
+          register: ufw_del
+          failed_when: false
+          changed_when: "'Rule deleted' in (ufw_del.stdout | default(''))"
+
+        - name: Remove firewalld rule for 8080 (RHEL family)
+          firewalld:
+            port: "{{ listen_port }}/tcp"
+            permanent: true
+            state: disabled
+            immediate: true
+          when: ansible_facts.os_family == "RedHat"
+      when: (action | default('deploy') | lower) == "undeploy"
